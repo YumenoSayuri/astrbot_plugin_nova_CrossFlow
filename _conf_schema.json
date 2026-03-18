@@ -1,0 +1,43 @@
+{
+    "allowed_sender_ids": {
+        "description": "允许使用跨聊天功能的QQ号列表",
+        "hint": "留空表示仅管理员可用。填入QQ号后，这些用户也可以使用跨聊天指令（逗号分隔或逐行添加）",
+        "type": "list",
+        "default": []
+    },
+    "allowed_target_group_ids": {
+        "description": "允许发送的目标群号白名单",
+        "hint": "留空表示不限制，可以发送到机器人加入的任意群。填入群号后，只能发送到这些群",
+        "type": "list",
+        "default": []
+    },
+    "allowed_target_user_ids": {
+        "description": "允许发送的目标用户QQ号白名单",
+        "hint": "留空表示不限制。填入QQ号后，只能给这些用户发私聊",
+        "type": "list",
+        "default": []
+    },
+    "enable_temp_session": {
+        "description": "启用临时会话（通过共同群发送私聊给非好友）",
+        "hint": "开启后，给非好友用户发私聊时会自动查找共同群组，通过群临时会话通道发送",
+        "type": "bool",
+        "default": true
+    },
+    "send_delay": {
+        "description": "消息发送延迟（秒）",
+        "hint": "跨聊天发送消息前的延迟，防止风控。0表示无延迟",
+        "type": "float",
+        "slider": {
+            "min": 0,
+            "max": 5.0,
+            "step": 0.1
+        },
+        "default": 0.5
+    },
+    "max_text_length": {
+        "description": "单条消息最大字符数",
+        "hint": "超过此长度的消息会被截断，防止刷屏。0表示不限制",
+        "type": "int",
+        "default": 2000
+    }
+}
