@@ -214,14 +214,19 @@ def check_permission(
     Args:
         sender_id: 发送者QQ号
         is_admin: 是否为管理员
-        allowed_sender_ids: 允许的发送者列表
+        allowed_sender_ids: 允许的发送者列表（空列表=不限制，所有人可用）
 
     Returns:
         是否有权限
     """
+    # 管理员始终有权限
     if is_admin:
         return True
-    if allowed_sender_ids and str(sender_id) in allowed_sender_ids:
+    # 如果白名单为空，表示不限制，所有人都可以用
+    if not allowed_sender_ids:
+        return True
+    # 如果白名单不为空，检查发送者是否在白名单中
+    if str(sender_id) in allowed_sender_ids:
         return True
     return False
 
