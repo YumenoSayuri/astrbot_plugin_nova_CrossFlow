@@ -1,20 +1,22 @@
 """
-Nova CrossFlow - 跨聊天指挥官
+Nova CrossFlow v1.1.0 - 跨聊天指挥官
 AstrBot 插件，通过 LLM Tool Calling 让 AI 自动跨群发消息、跨用户私聊、群临时会话。
+支持输出重定向：AI 可以把任何工具的输出（图片/语音/表情包等）重定向到其他群/私聊。
 
 用户只需用自然语言说：
   "你去XX群发一句XXX"
-  "给QQ号123456789发个私聊说XXX"
-  "帮我私聊一下XXX 跟他说XXX"
-AI 会自动调用对应工具完成发送。
+  "给XX群发个表情包"  (AI先redirect再调表情包工具)
+  "帮我私聊XXX 跟他说XXX"
 """
 
 import asyncio
+import time
 
 from astrbot.api import llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -30,6 +32,37 @@ from .utils import (
     send_private_message,
     smart_private_send,
 )
+
+
+# ==========================================
+# 重定向状态管理（按会话隔离）
+# ==========================================
+class RedirectState:
+    """存储单个会话的重定向状态"""
+    def __init__(self, target_type: str, target_id: str, created_at: float):
+        self.target_type = target_type  # "group" 或 "private"
+        self.target_id = target_id      # 群号或QQ号
+        self.created_at = created_at
+        self.intercept_count = 0        # 已拦截的消息数
+
+    def is_expired(self, timeout_seconds: float = 120.0) -> bool:
+        """检查是否超时"""
+        return (time.time() - self.created_at) > timeout_seconds
+
+
+# 全局重定向状态表：session_key -> RedirectState
+_redirect_states: dict[str, RedirectState] = {}
+
+REDIRECT_TIMEOUT_SECONDS = 120.0  # 重定向超时2分钟
+
+
+def _get_session_key(event: AstrMessageEvent) -> str:
+    """获取会话唯一标识"""
+    gid = event.get_group_id()
+    uid = event.get_sender_id()
+    if gid:
+        return f"group_{gid}_sender_{uid}"
+    return f"private_{uid}"
 
 
 class CrossFlowPlugin(Star):
@@ -61,10 +94,161 @@ class CrossFlowPlugin(Star):
         return False, reason
 
     def _get_bot(self, event: AstrMessageEvent):
-        """从事件中获取bot实例，如果不是aiocqhttp平台则返回None"""
+        """从事件中获取bot实例"""
         if isinstance(event, AiocqhttpMessageEvent):
             return event.bot
         return None
+
+    # ==========================================
+    # 输出重定向 Hook（核心）
+    # ==========================================
+    @filter.on_decorating_result(priority=5)
+    async def on_decorating_result(self, event: AstrMessageEvent):
+        """拦截所有即将发送的消息，如果有重定向标志则重定向到目标"""
+        session_key = _get_session_key(event)
+        state = _redirect_states.get(session_key)
+
+        if not state:
+            return  # 没有重定向，正常发送
+
+        # 检查超时
+        if state.is_expired(REDIRECT_TIMEOUT_SECONDS):
+            _redirect_states.pop(session_key, None)
+            logger.info(f"[CrossFlow] 重定向超时自动取消: session={session_key}")
+            return
+
+        # 检查是否为 aiocqhttp 平台
+        if not isinstance(event, AiocqhttpMessageEvent):
+            return
+
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+
+        bot = event.bot
+        target_type = state.target_type
+        target_id = int(state.target_id)
+
+        # 将消息链转为 OneBot JSON 格式
+        try:
+            messages = await AiocqhttpMessageEvent._parse_onebot_json(result)
+            if not messages:
+                return
+
+            if target_type == "group":
+                await bot.send_group_msg(group_id=target_id, message=messages)
+                logger.info(f"[CrossFlow] 已重定向消息到群 {target_id}")
+            else:
+                # 私聊（可能需要临时会话）
+                enable_temp = bool(self._get_cfg("enable_temp_session", True))
+                try:
+                    await bot.send_private_msg(user_id=target_id, message=messages)
+                    logger.info(f"[CrossFlow] 已重定向消息到用户 {target_id}")
+                except Exception as e:
+                    if enable_temp:
+                        common_gid = await find_common_group(bot, target_id)
+                        if common_gid:
+                            await bot.send_private_msg(
+                                user_id=target_id,
+                                group_id=common_gid,
+                                message=messages,
+                            )
+                            logger.info(
+                                f"[CrossFlow] 已通过临时会话(群{common_gid})重定向消息到用户 {target_id}"
+                            )
+                        else:
+                            logger.warning(f"[CrossFlow] 重定向私聊失败，无共同群: {e}")
+                            return  # 不拦截，让原消息正常发送
+                    else:
+                        logger.warning(f"[CrossFlow] 重定向私聊失败: {e}")
+                        return
+
+            state.intercept_count += 1
+
+            # 清空原消息，阻止发送到当前会话
+            result.chain.clear()
+            event.set_result(event.plain_result(""))
+            logger.info(
+                f"[CrossFlow] 消息已拦截并重定向: session={session_key}, "
+                f"target={target_type}:{target_id}, count={state.intercept_count}"
+            )
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 重定向消息失败: {e}")
+            # 失败时不拦截，让原消息正常发送
+
+    # ==========================================
+    # LLM Tool: 开启输出重定向
+    # ==========================================
+    @llm_tool(name="crossflow_redirect_output")
+    async def tool_redirect_output(
+        self,
+        event: AstrMessageEvent,
+        target_type: str,
+        target_id: str,
+    ) -> str:
+        """开启输出重定向。调用此工具后，你后续调用的所有其他工具（画图、发表情包、生成语音等）的输出都会被自动重定向到指定的群或私聊，而不是发到当前会话。当用户要求你"去XX群发个表情包"、"给某人私聊发张图"等需要把工具生成内容发到其他地方时，先调用此工具设置重定向目标，然后再调用对应的工具生成内容。完成后记得调用 crossflow_stop_redirect 取消重定向。
+
+        Args:
+            target_type(string): 目标类型，必须是 "group"（群聊）或 "private"（私聊）。
+            target_id(string): 目标ID，群号或QQ号，纯数字字符串。
+        """
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+
+        if target_type not in ("group", "private"):
+            return "错误：target_type 必须是 'group' 或 'private'。"
+
+        if not target_id or not target_id.strip().isdigit():
+            return "错误：target_id 必须是纯数字。"
+
+        target_id = target_id.strip()
+
+        # 白名单检查
+        allowed_groups = self._get_cfg("allowed_target_group_ids", [])
+        allowed_users = self._get_cfg("allowed_target_user_ids", [])
+        if not check_target_allowed(target_id, target_type, allowed_groups, allowed_users):
+            return f"错误：{target_type} {target_id} 不在允许的目标列表中。"
+
+        session_key = _get_session_key(event)
+        _redirect_states[session_key] = RedirectState(
+            target_type=target_type,
+            target_id=target_id,
+            created_at=time.time(),
+        )
+
+        target_name = "群" if target_type == "group" else "用户"
+        logger.info(f"[CrossFlow] 输出重定向已开启: session={session_key}, target={target_type}:{target_id}")
+        return (
+            f"输出重定向已开启。现在你调用任何工具生成的内容（文字/图片/语音/表情包等）"
+            f"都会自动发送到{target_name} {target_id}，而不是当前会话。"
+            f"完成后请调用 crossflow_stop_redirect 取消重定向。"
+            f"重定向将在 {int(REDIRECT_TIMEOUT_SECONDS)} 秒后自动取消。"
+        )
+
+    # ==========================================
+    # LLM Tool: 关闭输出重定向
+    # ==========================================
+    @llm_tool(name="crossflow_stop_redirect")
+    async def tool_stop_redirect(
+        self,
+        event: AstrMessageEvent,
+    ) -> str:
+        """关闭输出重定向，恢复正常发送模式。在完成跨聊天发送后调用此工具。
+
+        """
+        session_key = _get_session_key(event)
+        state = _redirect_states.pop(session_key, None)
+
+        if state:
+            logger.info(
+                f"[CrossFlow] 输出重定向已关闭: session={session_key}, "
+                f"共拦截 {state.intercept_count} 条消息"
+            )
+            return f"输出重定向已关闭。共有 {state.intercept_count} 条消息被重定向发送。现在恢复正常发送模式。"
+        else:
+            return "当前没有活跃的输出重定向。"
 
     # ==========================================
     # LLM Tool: 向指定群发送消息
@@ -76,7 +260,7 @@ class CrossFlowPlugin(Star):
         group_id: str,
         message: str,
     ) -> str:
-        """向指定的QQ群发送一条消息。当用户要求你去某个群发消息、通知某个群、在某个群说话时使用此工具。
+        """向指定的QQ群发送一条文本消息。当用户要求你去某个群发消息、通知某个群、在某个群说话时使用此工具。
 
         Args:
             group_id(string): 目标QQ群的群号，纯数字字符串。
@@ -94,21 +278,16 @@ class CrossFlowPlugin(Star):
             return "错误：群号必须是纯数字。"
 
         group_id = group_id.strip()
-
-        # 白名单检查
         allowed_groups = self._get_cfg("allowed_target_group_ids", [])
         if not check_target_allowed(group_id, "group", allowed_groups, []):
             return f"错误：群 {group_id} 不在允许发送的目标群列表中。"
 
-        # 延迟
         delay = float(self._get_cfg("send_delay", 0.5) or 0.5)
         if delay > 0:
             await asyncio.sleep(delay)
 
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
-        result = await send_group_message(
-            bot, int(group_id), message, max_length=max_len
-        )
+        result = await send_group_message(bot, int(group_id), message, max_length=max_len)
 
         if result["ok"]:
             return f"已成功向群 {group_id} 发送消息。"
@@ -125,7 +304,7 @@ class CrossFlowPlugin(Star):
         user_id: str,
         message: str,
     ) -> str:
-        """向指定的QQ用户发送一条私聊消息。当用户要求你私聊某人、给某人发消息、联系某人时使用此工具。如果目标用户不是机器人好友，会自动尝试通过共同群的临时会话发送。
+        """向指定的QQ用户发送一条私聊文本消息。当用户要求你私聊某人、给某人发消息、联系某人时使用此工具。如果目标不是好友会自动尝试临时会话。
 
         Args:
             user_id(string): 目标用户的QQ号，纯数字字符串。
@@ -143,13 +322,10 @@ class CrossFlowPlugin(Star):
             return "错误：QQ号必须是纯数字。"
 
         user_id = user_id.strip()
-
-        # 白名单检查
         allowed_users = self._get_cfg("allowed_target_user_ids", [])
         if not check_target_allowed(user_id, "private", [], allowed_users):
             return f"错误：用户 {user_id} 不在允许发送的目标用户列表中。"
 
-        # 延迟
         delay = float(self._get_cfg("send_delay", 0.5) or 0.5)
         if delay > 0:
             await asyncio.sleep(delay)
@@ -158,11 +334,8 @@ class CrossFlowPlugin(Star):
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
 
         result = await smart_private_send(
-            bot,
-            int(user_id),
-            message,
-            enable_temp_session=enable_temp,
-            max_length=max_len,
+            bot, int(user_id), message,
+            enable_temp_session=enable_temp, max_length=max_len,
         )
 
         if result["ok"]:
@@ -177,13 +350,10 @@ class CrossFlowPlugin(Star):
             return msg
 
     # ==========================================
-    # LLM Tool: 获取机器人的群列表
+    # LLM Tool: 获取群列表
     # ==========================================
     @llm_tool(name="crossflow_get_group_list")
-    async def tool_get_group_list(
-        self,
-        event: AstrMessageEvent,
-    ) -> str:
+    async def tool_get_group_list(self, event: AstrMessageEvent) -> str:
         """获取机器人当前加入的所有QQ群列表。当用户问机器人在哪些群、查看群列表、需要知道群号时使用此工具。
 
         """
@@ -206,14 +376,10 @@ class CrossFlowPlugin(Star):
         return f"机器人加入了 {len(groups)} 个群：\n" + "\n".join(lines)
 
     # ==========================================
-    # LLM Tool: 查找与目标用户的共同群
+    # LLM Tool: 查找共同群
     # ==========================================
     @llm_tool(name="crossflow_find_common_group")
-    async def tool_find_common_group(
-        self,
-        event: AstrMessageEvent,
-        user_id: str,
-    ) -> str:
+    async def tool_find_common_group(self, event: AstrMessageEvent, user_id: str) -> str:
         """查找机器人与指定QQ用户共同所在的群。当需要判断能否给某人发临时会话、查找共同群时使用此工具。
 
         Args:
@@ -229,30 +395,20 @@ class CrossFlowPlugin(Star):
         user_id = user_id.strip()
         target_uid = int(user_id)
 
-        # 先检查是否是好友
         friend = await is_friend(bot, target_uid)
         if friend:
-            return f"用户 {user_id} 是机器人的好友，可以直接发送私聊消息，无需通过临时会话。"
+            return f"用户 {user_id} 是机器人的好友，可以直接发送私聊消息。"
 
         common_gid = await find_common_group(bot, target_uid)
         if common_gid:
             try:
-                info = await bot.call_action(
-                    "get_group_info", group_id=common_gid
-                )
+                info = await bot.call_action("get_group_info", group_id=common_gid)
                 group_name = info.get("group_name", "未知")
             except Exception:
                 group_name = "未知"
-
-            return (
-                f"用户 {user_id} 不是机器人好友，但找到共同群：{group_name} (群号: {common_gid})。"
-                f"可以通过此群发送临时会话。"
-            )
+            return f"用户 {user_id} 不是好友，但找到共同群：{group_name} (群号: {common_gid})。可通过临时会话联系。"
         else:
-            return (
-                f"用户 {user_id} 不是机器人好友，且未找到任何共同群。"
-                f"无法通过临时会话联系该用户。"
-            )
+            return f"用户 {user_id} 不是好友，且未找到共同群。无法通过临时会话联系。"
 
     # ==========================================
     # 手动命令：/跨流帮助
@@ -261,139 +417,84 @@ class CrossFlowPlugin(Star):
     async def cmd_help(self, event: AstrMessageEvent):
         """查看 CrossFlow 帮助信息"""
         help_text = (
-            "🌐 Nova CrossFlow 跨聊天指挥官\n"
+            "🌐 Nova CrossFlow 跨聊天指挥官 v1.1.0\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "🤖 自然语言模式（推荐）：\n"
-            '  直接说 "去群123456发一句XXX"\n'
-            '  直接说 "给QQ号789发个私聊说XXX"\n'
-            '  直接说 "你在哪些群里？"\n\n'
-            "⌨️ 手动命令模式：\n"
+            '  "去群123456发一句XXX"\n'
+            '  "去XX群发个表情包"\n'
+            '  "给QQ号789私聊发张图"\n\n'
+            "🔄 输出重定向（新功能！）：\n"
+            "  AI 可以把任何工具的输出\n"
+            "  （图片/语音/表情包等）\n"
+            "  重定向到其他群或私聊\n\n"
+            "⌨️ 手动命令：\n"
             "  /跨群 <群号> <消息>\n"
-            "    → 向指定群发送消息\n"
             "  /跨私聊 <QQ号> <消息>\n"
-            "    → 向指定用户发私聊\n"
-            "    → 非好友自动尝试临时会话\n"
-            "  /跨流帮助\n"
-            "    → 查看本帮助信息\n\n"
-            "ℹ️ 说明：\n"
-            "  • 仅管理员或白名单用户可用\n"
-            "  • 非好友自动检测共同群发临时会话\n"
-            "  • 可在任意群或私聊中指挥发送"
+            "  /跨流帮助"
         )
         yield event.plain_result(help_text)
 
     # ==========================================
-    # 手动命令：/跨群 <群号> <消息>
+    # 手动命令：/跨群
     # ==========================================
     @filter.command("跨群")
-    async def cmd_send_group(
-        self,
-        event: AiocqhttpMessageEvent,
-        group_id_str: str = "",
-        *msg_parts: str,
-    ):
+    async def cmd_send_group(self, event: AiocqhttpMessageEvent, group_id_str: str = "", *msg_parts: str):
         """向指定群发送消息: /跨群 <群号> <消息内容>"""
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             yield event.plain_result(f"❌ {perm_reason}")
             return
-
-        if not group_id_str:
+        if not group_id_str or not group_id_str.isdigit():
             yield event.plain_result("❌ 用法：/跨群 <群号> <消息内容>")
             return
-
-        if not group_id_str.isdigit():
-            yield event.plain_result("❌ 群号必须是纯数字")
-            return
-
         message = " ".join(msg_parts).strip()
         if not message:
             yield event.plain_result("❌ 请提供要发送的消息内容")
             return
-
-        target_gid = int(group_id_str)
-
-        # 检查白名单
         allowed_groups = self._get_cfg("allowed_target_group_ids", [])
         if not check_target_allowed(group_id_str, "group", allowed_groups, []):
             yield event.plain_result(f"❌ 群 {group_id_str} 不在允许的目标群列表中")
             return
-
-        # 延迟
         delay = float(self._get_cfg("send_delay", 0.5) or 0.5)
         if delay > 0:
             await asyncio.sleep(delay)
-
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
-        result = await send_group_message(
-            event.bot, target_gid, message, max_length=max_len
-        )
-
+        result = await send_group_message(event.bot, int(group_id_str), message, max_length=max_len)
         if result["ok"]:
             yield event.plain_result(f"✅ 已向群 {group_id_str} 发送消息")
         else:
-            yield event.plain_result(
-                f"❌ 发送失败: {result.get('error', '未知错误')}"
-            )
+            yield event.plain_result(f"❌ 发送失败: {result.get('error', '未知错误')}")
 
     # ==========================================
-    # 手动命令：/跨私聊 <QQ号> <消息>
+    # 手动命令：/跨私聊
     # ==========================================
     @filter.command("跨私聊")
-    async def cmd_send_private(
-        self,
-        event: AiocqhttpMessageEvent,
-        user_id_str: str = "",
-        *msg_parts: str,
-    ):
+    async def cmd_send_private(self, event: AiocqhttpMessageEvent, user_id_str: str = "", *msg_parts: str):
         """向指定用户发私聊: /跨私聊 <QQ号> <消息内容>"""
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             yield event.plain_result(f"❌ {perm_reason}")
             return
-
-        if not user_id_str:
+        if not user_id_str or not user_id_str.isdigit():
             yield event.plain_result("❌ 用法：/跨私聊 <QQ号> <消息内容>")
             return
-
-        if not user_id_str.isdigit():
-            yield event.plain_result("❌ QQ号必须是纯数字")
-            return
-
         message = " ".join(msg_parts).strip()
         if not message:
             yield event.plain_result("❌ 请提供要发送的消息内容")
             return
-
-        target_uid = int(user_id_str)
-
-        # 检查白名单
         allowed_users = self._get_cfg("allowed_target_user_ids", [])
         if not check_target_allowed(user_id_str, "private", [], allowed_users):
             yield event.plain_result(f"❌ 用户 {user_id_str} 不在允许的目标用户列表中")
             return
-
-        # 延迟
         delay = float(self._get_cfg("send_delay", 0.5) or 0.5)
         if delay > 0:
             await asyncio.sleep(delay)
-
         enable_temp = bool(self._get_cfg("enable_temp_session", True))
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
-
-        result = await smart_private_send(
-            event.bot,
-            target_uid,
-            message,
-            enable_temp_session=enable_temp,
-            max_length=max_len,
-        )
-
+        result = await smart_private_send(event.bot, int(user_id_str), message, enable_temp_session=enable_temp, max_length=max_len)
         if result["ok"]:
             channel = result.get("channel", "私聊")
-            yield event.plain_result(
-                f"✅ 已通过{channel}向 {user_id_str} 发送消息"
-            )
+            yield event.plain_result(f"✅ 已通过{channel}向 {user_id_str} 发送消息")
         else:
             hint = result.get("hint", "")
             error = result.get("error", "未知错误")
