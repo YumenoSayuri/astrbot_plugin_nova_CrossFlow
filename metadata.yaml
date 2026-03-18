@@ -1,7 +1,7 @@
 name: astrbot_plugin_nova_CrossFlow
 display_name: "Nova CrossFlow \u8DE8\u804A\u5929\u6307\u6325\u5B98"
 desc: "[仅aiocqhttp] 跨群发消息、跨用户私聊、群临时会话。支持在A群/私聊中指挥AI给B群或指定用户发消息，自动检测共同群组实现临时会话。"
-help: "发送 /cf帮助 查看完整用法"
-version: v1.1.0
+help: "发送 /跨流帮助 查看完整用法"
+version: v1.1.1
 author: Nova (by 辉宝)
-repo: ""
+repo: https://github.com/YumenoSayuri/astrbot_plugin_nova_CrossFlow

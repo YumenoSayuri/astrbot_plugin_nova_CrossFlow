@@ -122,6 +122,23 @@ class CrossFlowPlugin(Star):
         )
         event_id = id(event)
 
+        # 预先查找共同群（用于非好友的临时会话）
+        _common_group_id: Optional[int] = None
+
+        async def _find_temp_session_group():
+            nonlocal _common_group_id
+            if state.target_type == "private" and _common_group_id is None:
+                try:
+                    target_uid = int(state.target_id)
+                    friend_check = await is_friend(bot, target_uid)
+                    if not friend_check:
+                        gid = await find_common_group(bot, target_uid)
+                        if gid:
+                            _common_group_id = gid
+                            logger.info(f"[CrossFlow] 找到临时会话通道: group_id={gid}")
+                except Exception as e:
+                    logger.debug(f"[CrossFlow] 查找共同群失败: {e}")
+
         async def redirected_send(message: MessageChain):
             """被重定向的 send 方法"""
             # 超时检查
@@ -133,6 +150,7 @@ class CrossFlowPlugin(Star):
             try:
                 target_id_int = int(state.target_id)
                 if state.target_type == "group":
+                    # 群消息直接发
                     await AiocqhttpMessageEvent.send_message(
                         bot=bot,
                         message_chain=message,
@@ -140,17 +158,31 @@ class CrossFlowPlugin(Star):
                         session_id=str(target_id_int),
                     )
                 else:
-                    await AiocqhttpMessageEvent.send_message(
-                        bot=bot,
-                        message_chain=message,
-                        is_group=False,
-                        session_id=str(target_id_int),
-                    )
+                    # 私聊：先尝试查找共同群
+                    await _find_temp_session_group()
+
+                    # 转为 OneBot JSON 格式
+                    messages = await AiocqhttpMessageEvent._parse_onebot_json(message)
+                    if not messages:
+                        logger.warning("[CrossFlow] 消息解析为空，跳过")
+                        return
+
+                    # 构建发送参数
+                    send_params = {
+                        "user_id": target_id_int,
+                        "message": messages,
+                    }
+                    # 如果有共同群，加上 group_id 走临时会话
+                    if _common_group_id:
+                        send_params["group_id"] = _common_group_id
+
+                    await bot.send_private_msg(**send_params)
 
                 state.intercept_count += 1
+                channel = f"临时会话(via群{_common_group_id})" if _common_group_id and state.target_type == "private" else state.target_type
                 logger.info(
                     f"[CrossFlow] 消息已重定向: "
-                    f"target={state.target_type}:{state.target_id}, "
+                    f"target={channel}:{state.target_id}, "
                     f"count={state.intercept_count}"
                 )
             except Exception as e:
