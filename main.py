@@ -44,12 +44,21 @@ class CrossFlowPlugin(Star):
         except (KeyError, TypeError):
             return default
 
-    def _check_perm(self, event: AstrMessageEvent) -> bool:
-        """检查用户权限"""
+    def _check_perm(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """检查用户权限，返回 (是否有权限, 拒绝原因)"""
         sender_id = str(event.get_sender_id())
         is_admin = event.is_admin()
         allowed = self._get_cfg("allowed_sender_ids", [])
-        return check_permission(sender_id, is_admin, allowed)
+        has_perm = check_permission(sender_id, is_admin, allowed)
+        if has_perm:
+            return True, ""
+        reason = (
+            f"用户 {sender_id} 不在 CrossFlow 插件的发送者白名单中，"
+            f"且不是 AstrBot 管理员。请将该用户的QQ号添加到插件配置的"
+            f"'允许使用跨聊天功能的QQ号白名单'中，或将其添加为 AstrBot 管理员。"
+        )
+        logger.warning(f"[CrossFlow] 权限拒绝: sender_id={sender_id}, is_admin={is_admin}, allowed_list={allowed}")
+        return False, reason
 
     def _get_bot(self, event: AstrMessageEvent):
         """从事件中获取bot实例，如果不是aiocqhttp平台则返回None"""
@@ -77,8 +86,9 @@ class CrossFlowPlugin(Star):
         if not bot:
             return "错误：当前平台不支持跨聊天发送，仅支持QQ（aiocqhttp）平台。"
 
-        if not self._check_perm(event):
-            return "错误：你没有权限使用跨聊天发送功能。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
 
         if not group_id or not group_id.strip().isdigit():
             return "错误：群号必须是纯数字。"
@@ -125,8 +135,9 @@ class CrossFlowPlugin(Star):
         if not bot:
             return "错误：当前平台不支持跨聊天发送，仅支持QQ（aiocqhttp）平台。"
 
-        if not self._check_perm(event):
-            return "错误：你没有权限使用跨聊天发送功能。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
 
         if not user_id or not user_id.strip().isdigit():
             return "错误：QQ号必须是纯数字。"
@@ -282,8 +293,9 @@ class CrossFlowPlugin(Star):
         *msg_parts: str,
     ):
         """向指定群发送消息: /跨群 <群号> <消息内容>"""
-        if not self._check_perm(event):
-            yield event.plain_result("❌ 你没有权限使用跨聊天功能")
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            yield event.plain_result(f"❌ {perm_reason}")
             return
 
         if not group_id_str:
@@ -335,8 +347,9 @@ class CrossFlowPlugin(Star):
         *msg_parts: str,
     ):
         """向指定用户发私聊: /跨私聊 <QQ号> <消息内容>"""
-        if not self._check_perm(event):
-            yield event.plain_result("❌ 你没有权限使用跨聊天功能")
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            yield event.plain_result(f"❌ {perm_reason}")
             return
 
         if not user_id_str:
