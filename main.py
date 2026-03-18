@@ -224,16 +224,19 @@ class CrossFlowPlugin(Star):
         self,
         event: AstrMessageEvent,
     ) -> str:
-        """关闭输出重定向，恢复正常发送模式。在完成跨聊天发送后调用此工具。
+        """关闭输出重定向，恢复正常发送模式。在完成跨聊天发送后调用此工具。注意：请在所有其他工具调用完成后再调用此工具，不要和其他工具同时调用。
 
         """
         event_id = id(event)
-        state = _active_redirects.pop(event_id, None)
+        state = _active_redirects.get(event_id)
 
         if state:
+            # 延迟恢复：等待并行的工具调用完成发送
+            await asyncio.sleep(3.0)
+            _active_redirects.pop(event_id, None)
             event.send = state.original_send
             logger.info(
-                f"[CrossFlow] 输出重定向已关闭: "
+                f"[CrossFlow] 输出重定向已关闭（延迟3秒恢复）: "
                 f"共拦截 {state.intercept_count} 条消息"
             )
             return f"输出重定向已关闭。共有 {state.intercept_count} 条消息被重定向发送。现在恢复正常发送模式。"
