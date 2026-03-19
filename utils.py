@@ -14,19 +14,70 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 )
 
 
+def _split_text_segments(text: str, max_segment_length: int = 500) -> list[str]:
+    """将长文本按段落/句号分割成多段
+
+    Args:
+        text: 原始文本
+        max_segment_length: 每段最大字符数
+
+    Returns:
+        分段后的文本列表
+    """
+    if len(text) <= max_segment_length:
+        return [text]
+
+    segments = []
+    # 先按换行符分段
+    paragraphs = text.split("\n")
+    current = ""
+
+    for para in paragraphs:
+        if len(current) + len(para) + 1 <= max_segment_length:
+            current = current + "\n" + para if current else para
+        else:
+            if current:
+                segments.append(current.strip())
+            # 如果单个段落超长，按句号再切
+            if len(para) > max_segment_length:
+                sentences = para.replace("。", "。\n").replace("！", "！\n").replace("？", "？\n").split("\n")
+                sub_current = ""
+                for s in sentences:
+                    if len(sub_current) + len(s) <= max_segment_length:
+                        sub_current += s
+                    else:
+                        if sub_current:
+                            segments.append(sub_current.strip())
+                        sub_current = s
+                current = sub_current
+            else:
+                current = para
+
+    if current and current.strip():
+        segments.append(current.strip())
+
+    return segments if segments else [text]
+
+
 async def send_group_message(
     bot: CQHttp,
     group_id: int,
     text: str,
     max_length: int = 2000,
+    split_send: bool = True,
+    split_segment_length: int = 500,
+    split_delay: float = 0.5,
 ) -> dict:
-    """向指定群发送文本消息
+    """向指定群发送文本消息，支持分段发送
 
     Args:
         bot: aiocqhttp bot实例
         group_id: 目标群号
         text: 消息内容
         max_length: 最大字符数，0表示不限制
+        split_send: 是否分段发送长文本
+        split_segment_length: 分段长度
+        split_delay: 分段发送间隔（秒）
 
     Returns:
         发送结果dict
@@ -34,11 +85,22 @@ async def send_group_message(
     if max_length > 0 and len(text) > max_length:
         text = text[:max_length] + "\n...(消息过长已截断)"
 
-    message = [{"type": "text", "data": {"text": text}}]
     try:
-        result = await bot.send_group_msg(group_id=group_id, message=message)
-        logger.info(f"[CrossFlow] 跨群发送成功: group_id={group_id}")
-        return {"ok": True, "data": result}
+        if split_send and len(text) > split_segment_length:
+            segments = _split_text_segments(text, split_segment_length)
+            last_result = None
+            for i, seg in enumerate(segments):
+                message = [{"type": "text", "data": {"text": seg}}]
+                last_result = await bot.send_group_msg(group_id=group_id, message=message)
+                if i < len(segments) - 1:
+                    await asyncio.sleep(split_delay)
+            logger.info(f"[CrossFlow] 跨群分段发送成功: group_id={group_id}, 共{len(segments)}段")
+            return {"ok": True, "data": last_result, "segments": len(segments)}
+        else:
+            message = [{"type": "text", "data": {"text": text}}]
+            result = await bot.send_group_msg(group_id=group_id, message=message)
+            logger.info(f"[CrossFlow] 跨群发送成功: group_id={group_id}")
+            return {"ok": True, "data": result}
     except Exception as e:
         logger.warning(f"[CrossFlow] 跨群发送失败: group_id={group_id}, error={e}")
         return {"ok": False, "error": str(e)}
@@ -50,8 +112,11 @@ async def send_private_message(
     text: str,
     group_id: Optional[int] = None,
     max_length: int = 2000,
+    split_send: bool = False,
+    split_segment_length: int = 500,
+    split_delay: float = 0.5,
 ) -> dict:
-    """向指定用户发送私聊消息
+    """向指定用户发送私聊消息，支持分段发送
 
     Args:
         bot: aiocqhttp bot实例
@@ -59,6 +124,9 @@ async def send_private_message(
         text: 消息内容
         group_id: 可选，通过此群的临时会话通道发送（用于非好友）
         max_length: 最大字符数，0表示不限制
+        split_send: 是否分段发送
+        split_segment_length: 分段长度
+        split_delay: 分段间隔（秒）
 
     Returns:
         发送结果dict
@@ -66,18 +134,28 @@ async def send_private_message(
     if max_length > 0 and len(text) > max_length:
         text = text[:max_length] + "\n...(消息过长已截断)"
 
-    message = [{"type": "text", "data": {"text": text}}]
-    params = {"user_id": user_id, "message": message}
-
-    # 如果提供了group_id，添加到参数中以走临时会话通道
+    base_params = {"user_id": user_id}
     if group_id is not None:
-        params["group_id"] = group_id
+        base_params["group_id"] = group_id
 
     try:
-        result = await bot.send_private_msg(**params)
-        channel = f"临时会话(via群{group_id})" if group_id else "私聊"
-        logger.info(f"[CrossFlow] {channel}发送成功: user_id={user_id}")
-        return {"ok": True, "data": result, "channel": channel}
+        if split_send and len(text) > split_segment_length:
+            segments = _split_text_segments(text, split_segment_length)
+            last_result = None
+            for i, seg in enumerate(segments):
+                message = [{"type": "text", "data": {"text": seg}}]
+                last_result = await bot.send_private_msg(**base_params, message=message)
+                if i < len(segments) - 1:
+                    await asyncio.sleep(split_delay)
+            channel = f"临时会话(via群{group_id})" if group_id else "私聊"
+            logger.info(f"[CrossFlow] {channel}分段发送成功: user_id={user_id}, 共{len(segments)}段")
+            return {"ok": True, "data": last_result, "channel": channel, "segments": len(segments)}
+        else:
+            message = [{"type": "text", "data": {"text": text}}]
+            result = await bot.send_private_msg(**base_params, message=message)
+            channel = f"临时会话(via群{group_id})" if group_id else "私聊"
+            logger.info(f"[CrossFlow] {channel}发送成功: user_id={user_id}")
+            return {"ok": True, "data": result, "channel": channel}
     except Exception as e:
         logger.warning(f"[CrossFlow] 私聊发送失败: user_id={user_id}, error={e}")
         return {"ok": False, "error": str(e)}
@@ -157,6 +235,9 @@ async def smart_private_send(
     text: str,
     enable_temp_session: bool = True,
     max_length: int = 2000,
+    split_send: bool = False,
+    split_segment_length: int = 500,
+    split_delay: float = 0.5,
 ) -> dict:
     """智能私聊发送
 
@@ -178,13 +259,17 @@ async def smart_private_send(
     friend = await is_friend(bot, user_id)
 
     if friend:
-        # 是好友，直接发
-        return await send_private_message(bot, user_id, text, max_length=max_length)
+        return await send_private_message(
+            bot, user_id, text, max_length=max_length,
+            split_send=split_send, split_segment_length=split_segment_length, split_delay=split_delay,
+        )
 
     # 不是好友
     if not enable_temp_session:
-        # 不启用临时会话，直接尝试发（可能失败）
-        result = await send_private_message(bot, user_id, text, max_length=max_length)
+        result = await send_private_message(
+            bot, user_id, text, max_length=max_length,
+            split_send=split_send, split_segment_length=split_segment_length, split_delay=split_delay,
+        )
         if not result["ok"]:
             result["hint"] = "目标用户不是好友，且未启用临时会话功能"
         return result
@@ -192,13 +277,15 @@ async def smart_private_send(
     # 启用了临时会话，查找共同群
     common_gid = await find_common_group(bot, user_id)
     if common_gid:
-        # 通过共同群的临时会话通道发送
         return await send_private_message(
-            bot, user_id, text, group_id=common_gid, max_length=max_length
+            bot, user_id, text, group_id=common_gid, max_length=max_length,
+            split_send=split_send, split_segment_length=split_segment_length, split_delay=split_delay,
         )
     else:
-        # 没有共同群，直接尝试发送（大概率失败）
-        result = await send_private_message(bot, user_id, text, max_length=max_length)
+        result = await send_private_message(
+            bot, user_id, text, max_length=max_length,
+            split_send=split_send, split_segment_length=split_segment_length, split_delay=split_delay,
+        )
         if not result["ok"]:
             result["hint"] = "目标用户不是好友，且未找到共同群组，无法发送临时会话"
         return result

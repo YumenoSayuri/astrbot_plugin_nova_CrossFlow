@@ -349,7 +349,13 @@ class CrossFlowPlugin(Star):
         if delay > 0:
             await asyncio.sleep(delay)
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
-        result = await send_group_message(bot, int(group_id), message, max_length=max_len)
+        split_enabled = bool(self._get_cfg("split_send_enabled", False))
+        split_seg_len = int(self._get_cfg("split_segment_length", 500) or 500)
+        split_delay_val = float(self._get_cfg("split_delay", 0.5) or 0.5)
+        result = await send_group_message(
+            bot, int(group_id), message, max_length=max_len,
+            split_send=split_enabled, split_segment_length=split_seg_len, split_delay=split_delay_val,
+        )
         if result["ok"]:
             return f"已成功向群 {group_id} 发送消息。"
         return f"发送失败：{result.get('error', '未知错误')}"
@@ -382,7 +388,14 @@ class CrossFlowPlugin(Star):
             await asyncio.sleep(delay)
         enable_temp = bool(self._get_cfg("enable_temp_session", True))
         max_len = int(self._get_cfg("max_text_length", 2000) or 2000)
-        result = await smart_private_send(bot, int(user_id), message, enable_temp_session=enable_temp, max_length=max_len)
+        split_enabled = bool(self._get_cfg("split_send_enabled", False))
+        split_seg_len = int(self._get_cfg("split_segment_length", 500) or 500)
+        split_delay_val = float(self._get_cfg("split_delay", 0.5) or 0.5)
+        result = await smart_private_send(
+            bot, int(user_id), message,
+            enable_temp_session=enable_temp, max_length=max_len,
+            split_send=split_enabled, split_segment_length=split_seg_len, split_delay=split_delay_val,
+        )
         if result["ok"]:
             channel = result.get("channel", "私聊")
             return f"已成功通过{channel}向用户 {user_id} 发送消息。"
@@ -444,6 +457,140 @@ class CrossFlowPlugin(Star):
             except Exception:
                 group_name = "未知"
             return f"找到共同群：{group_name} (群号: {common_gid})。可通过临时会话联系。"
+    # ==========================================
+    # LLM Tool: 查询指定群的成员列表
+    # ==========================================
+    @llm_tool(name="crossflow_query_group_members")
+    async def tool_query_group_members(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        search_name: str = "",
+    ) -> str:
+        """查询指定QQ群的成员列表。可以查询任意群（不限当前群），通过群昵称或QQ名搜索特定成员获取其QQ号。当需要知道某个群里有谁、查找某人的QQ号、确认某人是否在某个群里时使用此工具。
+
+        Args:
+            group_id(string): 要查询的群号，纯数字字符串。
+            search_name(string): 可选，搜索关键词。填入后只返回群昵称或QQ名包含此关键词的成员，用于快速找人。留空返回全部成员摘要。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+
+        if not group_id or not group_id.strip().isdigit():
+            return "错误：群号必须是纯数字。"
+
+        group_id = group_id.strip()
+        gid_int = int(group_id)
+
+        try:
+            members = await bot.call_action("get_group_member_list", group_id=gid_int)
+            if not members or not isinstance(members, list):
+                return f"错误：无法获取群 {group_id} 的成员列表，可能是机器人不在该群或权限不足。"
+        except Exception as e:
+            return f"错误：获取群 {group_id} 成员列表失败: {e}"
+
+        # 处理成员数据
+        processed = []
+        for m in members:
+            uid = str(m.get("user_id", ""))
+            display_name = m.get("card") or m.get("nickname") or f"用户{uid}"
+            username = m.get("nickname") or f"用户{uid}"
+            role = m.get("role", "member")
+            processed.append({
+                "user_id": uid,
+                "display_name": display_name,
+                "username": username,
+                "role": role,
+            })
+
+        # 如果有搜索关键词，过滤
+        if search_name and search_name.strip():
+            keyword = search_name.strip().lower()
+            filtered = [
+                m for m in processed
+                if keyword in m["display_name"].lower()
+                or keyword in m["username"].lower()
+                or keyword in m["user_id"]
+            ]
+            if not filtered:
+                # 日志精简
+                logger.info(f"[CrossFlow] 群 {group_id} 中未找到匹配 '{search_name}' 的成员 (共{len(processed)}人)")
+                return f"在群 {group_id} (共{len(processed)}人) 中未找到匹配 '{search_name}' 的成员。"
+
+            lines = []
+            for m in filtered:
+                role_cn = {"owner": "群主", "admin": "管理", "member": "成员"}.get(m["role"], m["role"])
+                lines.append(f"- {m['display_name']}({m['username']}) QQ:{m['user_id']} [{role_cn}]")
+
+            logger.info(f"[CrossFlow] 群 {group_id} 搜索 '{search_name}' 找到 {len(filtered)} 人")
+            return f"群 {group_id} 中匹配 '{search_name}' 的成员 ({len(filtered)}人):\n" + "\n".join(lines)
+
+        # 无搜索关键词：返回摘要（日志只显示前5人）
+        total = len(processed)
+        preview = processed[:5]
+        preview_lines = []
+        for m in preview:
+            role_cn = {"owner": "群主", "admin": "管理", "member": "成员"}.get(m["role"], m["role"])
+            preview_lines.append(f"  {m['display_name']}({m['username']}) QQ:{m['user_id']} [{role_cn}]")
+
+        logger.info(f"[CrossFlow] 查询群 {group_id} 成员: 共{total}人，前{len(preview)}人:\n" + "\n".join(preview_lines))
+
+        # 返回给 AI 的是完整列表（AI 需要用来找人）
+        import json
+        result_data = {
+            "group_id": group_id,
+            "member_count": total,
+            "members": processed,
+        }
+        return json.dumps(result_data, ensure_ascii=False)
+
+    # ==========================================
+    # LLM Tool: 查询指定群的基本信息
+    # ==========================================
+    @llm_tool(name="crossflow_query_group_info")
+    async def tool_query_group_info(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+    ) -> str:
+        """查询指定QQ群的基本信息（群名、群主、人数等）。当需要了解某个群的详细信息时使用此工具。
+
+        Args:
+            group_id(string): 要查询的群号，纯数字字符串。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+
+        if not group_id or not group_id.strip().isdigit():
+            return "错误：群号必须是纯数字。"
+
+        group_id = group_id.strip()
+        gid_int = int(group_id)
+
+        try:
+            info = await bot.call_action("get_group_info", group_id=gid_int)
+            if not info:
+                return f"错误：无法获取群 {group_id} 的信息。"
+        except Exception as e:
+            return f"错误：获取群 {group_id} 信息失败: {e}"
+
+        group_name = info.get("group_name", "未知")
+        member_count = info.get("member_count", "?")
+        max_member_count = info.get("max_member_count", "?")
+
+        result = (
+            f"群信息：\n"
+            f"- 群号: {group_id}\n"
+            f"- 群名: {group_name}\n"
+            f"- 当前人数: {member_count}\n"
+            f"- 最大人数: {max_member_count}"
+        )
+
+        logger.info(f"[CrossFlow] 查询群信息: {group_id} ({group_name}, {member_count}人)")
+        return result
+
         return f"用户 {user_id} 不是好友，且未找到共同群。无法联系。"
 
     # ==========================================
