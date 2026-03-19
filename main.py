@@ -591,7 +591,92 @@ class CrossFlowPlugin(Star):
         logger.info(f"[CrossFlow] 查询群信息: {group_id} ({group_name}, {member_count}人)")
         return result
 
-        return f"用户 {user_id} 不是好友，且未找到共同群。无法联系。"
+    # ==========================================
+    # LLM Tool: 跨群禁言
+    # ==========================================
+    @llm_tool(name="crossflow_ban_member")
+    async def tool_ban_member(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        duration: int = 600,
+    ) -> str:
+        """在指定QQ群中禁言某个用户。当用户要求禁言某人、让某人闭嘴时使用此工具。需要机器人在该群有管理员权限。
+
+        Args:
+            group_id(string): 群号，纯数字字符串。
+            user_id(string): 要禁言的用户QQ号，纯数字字符串。
+            duration(number): 禁言时长（秒），范围0-2592000（30天），0表示取消禁言。默认600秒（10分钟）。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+        if not group_id or not group_id.strip().isdigit():
+            return "错误：群号必须是纯数字。"
+        if not user_id or not user_id.strip().isdigit():
+            return "错误：用户QQ号必须是纯数字。"
+
+        gid = int(group_id.strip())
+        uid = int(user_id.strip())
+        dur = max(0, min(2592000, int(duration)))
+
+        try:
+            await bot.set_group_ban(group_id=gid, user_id=uid, duration=dur)
+            if dur == 0:
+                logger.info(f"[CrossFlow] 已解除禁言: 群{gid} 用户{uid}")
+                return f"已解除群 {group_id} 中用户 {user_id} 的禁言。"
+            else:
+                logger.info(f"[CrossFlow] 已禁言: 群{gid} 用户{uid} {dur}秒")
+                return f"已在群 {group_id} 中禁言用户 {user_id}，时长 {dur} 秒。"
+        except Exception as e:
+            logger.error(f"[CrossFlow] 禁言失败: 群{gid} 用户{uid}, {e}")
+            return f"禁言失败：{e}。可能是机器人不是该群管理员，或目标用户权限更高。"
+
+    # ==========================================
+    # LLM Tool: 跨群踢人
+    # ==========================================
+    @llm_tool(name="crossflow_kick_member")
+    async def tool_kick_member(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        reject_add: str = "false",
+    ) -> str:
+        """将指定用户从指定QQ群中踢出。当用户要求踢人、移除某人时使用此工具。需要机器人在该群有管理员权限。
+
+        Args:
+            group_id(string): 群号，纯数字字符串。
+            user_id(string): 要踢出的用户QQ号，纯数字字符串。
+            reject_add(string): 是否拒绝此人再次加群，"true"或"false"，默认"false"。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+        if not group_id or not group_id.strip().isdigit():
+            return "错误：群号必须是纯数字。"
+        if not user_id or not user_id.strip().isdigit():
+            return "错误：用户QQ号必须是纯数字。"
+
+        gid = int(group_id.strip())
+        uid = int(user_id.strip())
+        reject = reject_add.strip().lower() == "true"
+
+        try:
+            await bot.set_group_kick(group_id=gid, user_id=uid, reject_add_request=reject)
+            reject_text = "（已拒绝再次加群）" if reject else ""
+            logger.info(f"[CrossFlow] 已踢出: 群{gid} 用户{uid} {reject_text}")
+            return f"已将用户 {user_id} 从群 {group_id} 中踢出{reject_text}。"
+        except Exception as e:
+            logger.error(f"[CrossFlow] 踢人失败: 群{gid} 用户{uid}, {e}")
+            return f"踢人失败：{e}。可能是机器人不是该群管理员，或目标用户权限更高。"
 
     # ==========================================
     # 手动命令

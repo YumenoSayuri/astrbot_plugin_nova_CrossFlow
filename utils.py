@@ -14,6 +14,50 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 )
 
 
+import re
+
+
+def _parse_text_with_at(text: str) -> list[dict]:
+    """解析文本中的 [at:QQ号] 格式，转为 OneBot 消息段
+
+    支持格式：
+      [at:123456789] — at 指定用户
+      [at:all] — at 全体成员
+      普通文本保持为 text 段
+
+    Args:
+        text: 包含 [at:xxx] 的文本
+
+    Returns:
+        OneBot 消息段列表
+    """
+    if "[at:" not in text:
+        return [{"type": "text", "data": {"text": text}}]
+
+    segments = []
+    pattern = re.compile(r'\[at:(\d+|all)\]')
+    last_end = 0
+
+    for match in pattern.finditer(text):
+        # 添加 at 之前的文本
+        if match.start() > last_end:
+            before_text = text[last_end:match.start()]
+            if before_text:
+                segments.append({"type": "text", "data": {"text": before_text}})
+
+        # 添加 at 段
+        qq = match.group(1)
+        segments.append({"type": "at", "data": {"qq": qq}})
+        last_end = match.end()
+
+    # 添加最后的文本
+    if last_end < len(text):
+        remaining = text[last_end:]
+        if remaining:
+            segments.append({"type": "text", "data": {"text": remaining}})
+
+    return segments if segments else [{"type": "text", "data": {"text": text}}]
+
 def _split_text_segments(text: str, max_segment_length: int = 500) -> list[str]:
     """将长文本按段落/句号分割成多段
 
@@ -90,14 +134,14 @@ async def send_group_message(
             segments = _split_text_segments(text, split_segment_length)
             last_result = None
             for i, seg in enumerate(segments):
-                message = [{"type": "text", "data": {"text": seg}}]
+                message = _parse_text_with_at(seg)
                 last_result = await bot.send_group_msg(group_id=group_id, message=message)
                 if i < len(segments) - 1:
                     await asyncio.sleep(split_delay)
             logger.info(f"[CrossFlow] 跨群分段发送成功: group_id={group_id}, 共{len(segments)}段")
             return {"ok": True, "data": last_result, "segments": len(segments)}
         else:
-            message = [{"type": "text", "data": {"text": text}}]
+            message = _parse_text_with_at(text)
             result = await bot.send_group_msg(group_id=group_id, message=message)
             logger.info(f"[CrossFlow] 跨群发送成功: group_id={group_id}")
             return {"ok": True, "data": result}
