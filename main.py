@@ -339,9 +339,9 @@ class CrossFlowPlugin(Star):
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             return perm_reason
-        if not group_id or not group_id.strip().isdigit():
+        group_id = str(group_id).strip() if group_id else ""
+        if not group_id or not group_id.isdigit():
             return "错误：群号必须是纯数字。"
-        group_id = group_id.strip()
         allowed_groups = self._get_cfg("allowed_target_group_ids", [])
         if not check_target_allowed(group_id, "group", allowed_groups, []):
             return f"错误：群 {group_id} 不在允许发送的目标群列表中。"
@@ -377,9 +377,9 @@ class CrossFlowPlugin(Star):
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             return perm_reason
-        if not user_id or not user_id.strip().isdigit():
+        user_id = str(user_id).strip() if user_id else ""
+        if not user_id or not user_id.isdigit():
             return "错误：QQ号必须是纯数字。"
-        user_id = user_id.strip()
         allowed_users = self._get_cfg("allowed_target_user_ids", [])
         if not check_target_allowed(user_id, "private", [], allowed_users):
             return f"错误：用户 {user_id} 不在允许发送的目标用户列表中。"
@@ -442,9 +442,9 @@ class CrossFlowPlugin(Star):
         bot = self._get_bot(event)
         if not bot:
             return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
-        if not user_id or not user_id.strip().isdigit():
+        user_id = str(user_id).strip() if user_id else ""
+        if not user_id or not user_id.isdigit():
             return "错误：QQ号必须是纯数字。"
-        user_id = user_id.strip()
         target_uid = int(user_id)
         friend = await is_friend(bot, target_uid)
         if friend:
@@ -477,10 +477,9 @@ class CrossFlowPlugin(Star):
         if not bot:
             return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
 
-        if not group_id or not group_id.strip().isdigit():
+        group_id = str(group_id).strip() if group_id else ""
+        if not group_id or not group_id.isdigit():
             return "错误：群号必须是纯数字。"
-
-        group_id = group_id.strip()
         gid_int = int(group_id)
 
         try:
@@ -563,10 +562,9 @@ class CrossFlowPlugin(Star):
         if not bot:
             return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
 
-        if not group_id or not group_id.strip().isdigit():
+        group_id = str(group_id).strip() if group_id else ""
+        if not group_id or not group_id.isdigit():
             return "错误：群号必须是纯数字。"
-
-        group_id = group_id.strip()
         gid_int = int(group_id)
 
         try:
@@ -615,13 +613,15 @@ class CrossFlowPlugin(Star):
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             return perm_reason
-        if not group_id or not group_id.strip().isdigit():
+        group_id = str(group_id).strip() if group_id else ""
+        user_id = str(user_id).strip() if user_id else ""
+        if not group_id or not group_id.isdigit():
             return "错误：群号必须是纯数字。"
-        if not user_id or not user_id.strip().isdigit():
+        if not user_id or not user_id.isdigit():
             return "错误：用户QQ号必须是纯数字。"
 
-        gid = int(group_id.strip())
-        uid = int(user_id.strip())
+        gid = int(group_id)
+        uid = int(user_id)
         dur = max(0, min(2592000, int(duration)))
 
         try:
@@ -660,13 +660,15 @@ class CrossFlowPlugin(Star):
         has_perm, perm_reason = self._check_perm(event)
         if not has_perm:
             return perm_reason
-        if not group_id or not group_id.strip().isdigit():
+        group_id = str(group_id).strip() if group_id else ""
+        user_id = str(user_id).strip() if user_id else ""
+        if not group_id or not group_id.isdigit():
             return "错误：群号必须是纯数字。"
-        if not user_id or not user_id.strip().isdigit():
+        if not user_id or not user_id.isdigit():
             return "错误：用户QQ号必须是纯数字。"
 
-        gid = int(group_id.strip())
-        uid = int(user_id.strip())
+        gid = int(group_id)
+        uid = int(user_id)
         reject = reject_add.strip().lower() == "true"
 
         try:
