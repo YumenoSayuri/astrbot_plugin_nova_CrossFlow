@@ -588,6 +588,214 @@ class CrossFlowPlugin(Star):
 
         logger.info(f"[CrossFlow] 查询群信息: {group_id} ({group_name}, {member_count}人)")
         return result
+    # ==========================================
+    # LLM Tool: 获取任意群的聊天记录
+    # ==========================================
+    def _parse_msg_to_line(self, msg: dict) -> str:
+        """将单条 OneBot 消息转为文本行"""
+        from datetime import datetime
+        sender = msg.get("sender", {})
+        nickname = sender.get("card") or sender.get("nickname", "未知")
+        uid = str(sender.get("user_id", ""))
+        msg_time = datetime.fromtimestamp(msg.get("time", 0)).strftime("%m-%d %H:%M")
+        text_parts = []
+        for part in msg.get("message", []):
+            ptype = part.get("type", "")
+            if ptype == "text":
+                t = part.get("data", {}).get("text", "").strip()
+                if t:
+                    text_parts.append(t)
+            elif ptype == "image":
+                text_parts.append("[图片]")
+            elif ptype == "face":
+                text_parts.append("[表情]")
+            elif ptype == "at":
+                qq = part.get("data", {}).get("qq", "")
+                text_parts.append(f"[@{qq}]")
+            elif ptype == "record":
+                text_parts.append("[语音]")
+            elif ptype == "video":
+                text_parts.append("[视频]")
+            elif ptype == "reply":
+                text_parts.append("[回复]")
+        text = " ".join(text_parts).strip()
+        if text:
+            return f"[{msg_time}] {nickname}({uid}): {text}"
+        return ""
+
+    async def _summarize_messages(self, lines: list[str], group_id: str) -> str:
+        """用独立供应商对超出上限的消息进行总结"""
+        provider_id = str(self._get_cfg("history_summary_provider_id", "") or "").strip()
+        text_block = "\n".join(lines)
+        prompt = (
+            f"以下是QQ群{group_id}的一段聊天记录（{len(lines)}条消息），"
+            f"请用简洁的中文总结这段对话的主要内容、话题和关键信息：\n\n{text_block}"
+        )
+        try:
+            if provider_id:
+                provider = self.context.get_provider_by_id(provider_id)
+            else:
+                provider = self.context.get_using_provider()
+            if not provider:
+                return f"[更早的{len(lines)}条消息无法总结：未找到可用的LLM供应商]"
+            resp = await provider.text_chat(prompt=prompt)
+            summary = resp.completion_text.strip()
+            logger.info(f"[CrossFlow] 已总结群 {group_id} 超限的 {len(lines)} 条消息")
+            return summary
+        except Exception as e:
+            logger.error(f"[CrossFlow] 总结消息失败: {e}")
+            return f"[更早的{len(lines)}条消息总结失败: {e}]"
+
+    @llm_tool(name="crossflow_get_group_history")
+    async def tool_get_group_history(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        count: int = 0,
+    ) -> str:
+        """获取指定QQ群的最近聊天记录（带时间和发言人）。当需要查看某个群最近在聊什么、了解群动态、总结群聊内容时使用此工具。
+
+        Args:
+            group_id(string): 要查询的群号，纯数字字符串。
+            count(number): 获取的消息条数，0表示使用默认值。超过上限时会自动总结较早的消息。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+
+        group_id = str(group_id).strip() if group_id else ""
+        if not group_id or not group_id.isdigit():
+            return "错误：群号必须是纯数字。"
+
+        default_count = int(self._get_cfg("history_default_count", 30) or 30)
+        max_count = int(self._get_cfg("history_max_count", 200) or 200)
+        actual_count = int(count) if count and int(count) > 0 else default_count
+        gid_int = int(group_id)
+
+        try:
+            ret = await bot.call_action(
+                "get_group_msg_history",
+                group_id=gid_int,
+                message_seq=0,
+                count=actual_count,
+                reverseOrder=False,
+            )
+            messages = ret.get("messages", [])
+            if not messages:
+                return f"群 {group_id} 没有获取到任何聊天记录。"
+
+            chat_lines = []
+            for msg in messages:
+                line = self._parse_msg_to_line(msg)
+                if line:
+                    chat_lines.append(line)
+
+            if not chat_lines:
+                return f"群 {group_id} 的最近 {actual_count} 条消息中没有有效文本内容。"
+
+            # 超限处理
+            if len(chat_lines) > max_count:
+                recent_lines = chat_lines[-max_count:]
+                older_lines = chat_lines[:-max_count]
+                summary = await self._summarize_messages(older_lines, group_id)
+                preview = recent_lines[-3:] if len(recent_lines) > 3 else recent_lines
+                logger.info(f"[CrossFlow] 获取群 {group_id} 聊天记录: 共{len(chat_lines)}条, 返回最近{len(recent_lines)}条+总结{len(older_lines)}条")
+                return (
+                    f"群 {group_id} 共获取 {len(chat_lines)} 条消息。\n\n"
+                    f"【更早的 {len(older_lines)} 条消息总结】\n{summary}\n\n"
+                    f"【最近 {len(recent_lines)} 条消息原文】\n" + "\n".join(recent_lines)
+                )
+            else:
+                preview = chat_lines[-3:] if len(chat_lines) > 3 else chat_lines
+                logger.info(f"[CrossFlow] 获取群 {group_id} 聊天记录: 共{len(chat_lines)}条")
+                return f"群 {group_id} 最近 {len(chat_lines)} 条聊天记录：\n" + "\n".join(chat_lines)
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 获取群 {group_id} 聊天记录失败: {e}")
+            return f"获取群 {group_id} 聊天记录失败: {e}"
+
+    # ==========================================
+    # LLM Tool: 获取任意群中指定用户的消息
+    # ==========================================
+    @llm_tool(name="crossflow_get_user_messages")
+    async def tool_get_user_messages(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        count: int = 0,
+    ) -> str:
+        """获取指定QQ群中某个用户的最近聊天记录。当需要查看某人在某个群里说了什么、了解某人的发言内容时使用此工具。会从群聊历史中过滤出该用户的消息。
+
+        Args:
+            group_id(string): 要查询的群号，纯数字字符串。
+            user_id(string): 要查询的用户QQ号，纯数字字符串。
+            count(number): 从群历史中扫描的消息总数（不是用户消息数），0表示使用默认值。扫描越多找到的用户消息越多。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+
+        group_id = str(group_id).strip() if group_id else ""
+        user_id = str(user_id).strip() if user_id else ""
+        if not group_id or not group_id.isdigit():
+            return "错误：群号必须是纯数字。"
+        if not user_id or not user_id.isdigit():
+            return "错误：用户QQ号必须是纯数字。"
+
+        default_count = int(self._get_cfg("history_default_count", 30) or 30)
+        max_count = int(self._get_cfg("history_max_count", 200) or 200)
+        actual_count = int(count) if count and int(count) > 0 else default_count
+        gid_int = int(group_id)
+        target_uid = user_id
+
+        try:
+            ret = await bot.call_action(
+                "get_group_msg_history",
+                group_id=gid_int,
+                message_seq=0,
+                count=actual_count,
+                reverseOrder=False,
+            )
+            messages = ret.get("messages", [])
+            if not messages:
+                return f"群 {group_id} 没有获取到任何聊天记录。"
+
+            user_lines = []
+            for msg in messages:
+                sender = msg.get("sender", {})
+                msg_uid = str(sender.get("user_id", ""))
+                if msg_uid != target_uid:
+                    continue
+                line = self._parse_msg_to_line(msg)
+                if line:
+                    user_lines.append(line)
+
+            if not user_lines:
+                return f"在群 {group_id} 最近 {actual_count} 条消息中没有找到用户 {user_id} 的发言。"
+
+            # 超限处理
+            if len(user_lines) > max_count:
+                recent = user_lines[-max_count:]
+                older = user_lines[:-max_count]
+                summary = await self._summarize_messages(older, group_id)
+                logger.info(f"[CrossFlow] 用户 {user_id} 在群 {group_id}: 共{len(user_lines)}条, 返回最近{len(recent)}条+总结{len(older)}条")
+                return (
+                    f"用户 {user_id} 在群 {group_id} 共提取 {len(user_lines)} 条发言。\n\n"
+                    f"【更早的 {len(older)} 条发言总结】\n{summary}\n\n"
+                    f"【最近 {len(recent)} 条发言原文】\n" + "\n".join(recent)
+                )
+
+            logger.info(f"[CrossFlow] 用户 {user_id} 在群 {group_id}: 扫描{len(messages)}条, 找到{len(user_lines)}条")
+            return (
+                f"用户 {user_id} 在群 {group_id} 的最近发言（从{len(messages)}条群消息中提取了{len(user_lines)}条）：\n"
+                + "\n".join(user_lines)
+            )
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 获取用户 {user_id} 在群 {group_id} 的消息失败: {e}")
+            return f"获取失败: {e}"
+
 
     # ==========================================
     # LLM Tool: 跨群禁言

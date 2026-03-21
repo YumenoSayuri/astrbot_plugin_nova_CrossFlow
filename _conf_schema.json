@@ -67,5 +67,34 @@
             "step": 0.1
         },
         "default": 0.5
+    },
+    "history_default_count": {
+        "description": "聊天记录默认查询条数",
+        "hint": "AI 查询群聊天记录时的默认条数（AI不指定时使用此值）",
+        "type": "int",
+        "slider": {
+            "min": 10,
+            "max": 500,
+            "step": 10
+        },
+        "default": 30
+    },
+    "history_max_count": {
+        "description": "聊天记录最大查询上限",
+        "hint": "AI 查询超过此数时，只返回最近这么多条原文，更早的消息由独立供应商自动总结",
+        "type": "int",
+        "slider": {
+            "min": 50,
+            "max": 2000,
+            "step": 50
+        },
+        "default": 200
+    },
+    "history_summary_provider_id": {
+        "description": "聊天记录总结专用模型",
+        "hint": "当查询条数超过上限时，超出部分的消息由此模型自动总结。留空则使用默认模型。建议使用轻量便宜模型",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
     }
 }
