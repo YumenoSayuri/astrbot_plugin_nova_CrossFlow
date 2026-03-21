@@ -796,6 +796,75 @@ class CrossFlowPlugin(Star):
             logger.error(f"[CrossFlow] 获取用户 {user_id} 在群 {group_id} 的消息失败: {e}")
             return f"获取失败: {e}"
 
+    # ==========================================
+    # LLM Tool: 获取私聊聊天记录
+    # ==========================================
+    @llm_tool(name="crossflow_get_private_history")
+    async def tool_get_private_history(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        count: int = 0,
+    ) -> str:
+        """获取与指定用户的私聊聊天记录（带时间）。当需要查看与某人的私聊对话内容时使用此工具。需要该用户是机器人好友。
+
+        Args:
+            user_id(string): 要查询的用户QQ号，纯数字字符串。
+            count(number): 获取的消息条数，0表示使用默认值。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+
+        user_id = str(user_id).strip() if user_id else ""
+        if not user_id or not user_id.isdigit():
+            return "错误：用户QQ号必须是纯数字。"
+
+        default_count = int(self._get_cfg("history_default_count", 30) or 30)
+        max_count = int(self._get_cfg("history_max_count", 200) or 200)
+        actual_count = int(count) if count and int(count) > 0 else default_count
+        uid_int = int(user_id)
+
+        try:
+            ret = await bot.call_action(
+                "get_friend_msg_history",
+                user_id=uid_int,
+                message_seq=0,
+                count=actual_count,
+                reverseOrder=False,
+            )
+            messages = ret.get("messages", [])
+            if not messages:
+                return f"没有获取到与用户 {user_id} 的私聊记录。可能不是好友或没有聊天记录。"
+
+            chat_lines = []
+            for msg in messages:
+                line = self._parse_msg_to_line(msg)
+                if line:
+                    chat_lines.append(line)
+
+            if not chat_lines:
+                return f"与用户 {user_id} 的最近 {actual_count} 条私聊中没有有效文本内容。"
+
+            # 超限处理
+            if len(chat_lines) > max_count:
+                recent = chat_lines[-max_count:]
+                older = chat_lines[:-max_count]
+                summary = await self._summarize_messages(older, f"私聊_{user_id}")
+                logger.info(f"[CrossFlow] 私聊 {user_id}: 共{len(chat_lines)}条, 返回最近{len(recent)}条+总结{len(older)}条")
+                return (
+                    f"与用户 {user_id} 的私聊记录共 {len(chat_lines)} 条。\n\n"
+                    f"【更早的 {len(older)} 条消息总结】\n{summary}\n\n"
+                    f"【最近 {len(recent)} 条消息原文】\n" + "\n".join(recent)
+                )
+
+            logger.info(f"[CrossFlow] 获取与用户 {user_id} 的私聊记录: 共{len(chat_lines)}条")
+            return f"与用户 {user_id} 的最近 {len(chat_lines)} 条私聊记录：\n" + "\n".join(chat_lines)
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 获取与用户 {user_id} 的私聊记录失败: {e}")
+            return f"获取私聊记录失败: {e}。可能不支持此API或该用户不是好友。"
+
 
     # ==========================================
     # LLM Tool: 跨群禁言
