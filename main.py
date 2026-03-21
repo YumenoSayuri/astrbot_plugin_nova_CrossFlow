@@ -797,6 +797,231 @@ class CrossFlowPlugin(Star):
             return f"获取失败: {e}"
 
     # ==========================================
+    # LLM Tool: 转发消息到其他群/私聊
+    # ==========================================
+    @llm_tool(name="crossflow_forward_messages")
+    async def tool_forward_messages(
+        self,
+        event: AstrMessageEvent,
+        source_group_id: str,
+        target_type: str,
+        target_id: str,
+        count: int = 10,
+        mode: str = "merge",
+        filter_user_id: str = "",
+    ) -> str:
+        """从指定群获取最近X条消息，转发到目标群或私聊。当用户要求转发消息、把聊天记录发给某人/某群时使用此工具。支持只转发某个人的消息。
+
+        Args:
+            source_group_id(string): 源群号（从哪个群获取消息），纯数字字符串。
+            target_type(string): 目标类型，"group"（群聊）或 "private"（私聊好友）。
+            target_id(string): 目标ID，群号或好友QQ号，纯数字字符串。
+            count(number): 转发的消息条数，默认10条，最大200条。合并转发超100条会自动分批。
+            mode(string): 转发模式，"merge"（合并转发，默认）或 "single"（逐条转发）。
+            filter_user_id(string): 可选，只转发该用户的消息（QQ号纯数字）。留空则转发所有人的消息。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+
+        source_group_id = str(source_group_id).strip() if source_group_id else ""
+        target_id = str(target_id).strip() if target_id else ""
+        if not source_group_id or not source_group_id.isdigit():
+            return "错误：源群号必须是纯数字。"
+        if target_type not in ("group", "private"):
+            return "错误：target_type 必须是 'group' 或 'private'。"
+        if not target_id or not target_id.isdigit():
+            return "错误：目标ID必须是纯数字。"
+
+        count = max(1, min(1000, int(count)))
+        src_gid = int(source_group_id)
+        tgt_id = int(target_id)
+        filter_uid = str(filter_user_id).strip() if filter_user_id else ""
+
+        try:
+            # 如果要过滤用户，需要拉更多消息来找够 count 条
+            scan_count = count * 5 if filter_uid else count
+            scan_count = min(scan_count, 500)
+
+            ret = await bot.call_action(
+                "get_group_msg_history",
+                group_id=src_gid,
+                message_seq=0,
+                count=scan_count,
+                reverseOrder=False,
+            )
+            all_messages = ret.get("messages", [])
+            if not all_messages:
+                return f"源群 {source_group_id} 没有获取到任何消息。"
+
+            # 过滤用户（如果指定了）
+            if filter_uid:
+                messages = [
+                    m for m in all_messages
+                    if str(m.get("sender", {}).get("user_id", "")) == filter_uid
+                ][:count]
+                if not messages:
+                    return f"在源群 {source_group_id} 最近 {len(all_messages)} 条消息中没有找到用户 {filter_uid} 的发言。"
+            else:
+                messages = all_messages[:count]
+
+            target_name = "群" if target_type == "group" else "用户"
+
+            if mode == "single":
+                # 逐条转发
+                success = 0
+                for msg in messages:
+                    msg_id = msg.get("message_id")
+                    if not msg_id:
+                        continue
+                    try:
+                        if target_type == "group":
+                            await bot.call_action("forward_group_single_msg", group_id=tgt_id, message_id=msg_id)
+                        else:
+                            await bot.call_action("forward_friend_single_msg", user_id=tgt_id, message_id=msg_id)
+                        success += 1
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.debug(f"[CrossFlow] 逐条转发失败 msg_id={msg_id}: {e}")
+
+                filter_text = f"（用户 {filter_uid} 的）" if filter_uid else ""
+                logger.info(f"[CrossFlow] 逐条转发{filter_text}: {source_group_id} -> {target_type}:{target_id}, 成功{success}/{len(messages)}条")
+                return f"已逐条转发 {success} 条{filter_text}消息到{target_name} {target_id}。"
+
+            else:
+                # 合并转发（每100条一批）
+                nodes = []
+                for msg in messages:
+                    sender = msg.get("sender", {})
+                    node = {
+                        "type": "node",
+                        "data": {
+                            "name": sender.get("nickname", "未知"),
+                            "uin": sender.get("user_id", 0),
+                            "content": msg.get("message", []),
+                        },
+                    }
+                    nodes.append(node)
+
+                BATCH_SIZE = 100
+                total_batches = (len(nodes) + BATCH_SIZE - 1) // BATCH_SIZE
+
+                for batch_idx in range(total_batches):
+                    batch = nodes[batch_idx * BATCH_SIZE : (batch_idx + 1) * BATCH_SIZE]
+                    if target_type == "group":
+                        await bot.call_action("send_group_forward_msg", group_id=tgt_id, messages=batch)
+                    else:
+                        await bot.call_action("send_private_forward_msg", user_id=tgt_id, messages=batch)
+                    if batch_idx < total_batches - 1:
+                        await asyncio.sleep(1.0)
+
+                filter_text = f"（用户 {filter_uid} 的）" if filter_uid else ""
+                batch_text = f"，分{total_batches}批" if total_batches > 1 else ""
+                logger.info(f"[CrossFlow] 合并转发{filter_text}: {source_group_id} -> {target_type}:{target_id}, {len(nodes)}条{batch_text}")
+                return f"已合并转发 {len(nodes)} 条{filter_text}消息到{target_name} {target_id}{batch_text}。"
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 转发消息失败: {e}")
+            return f"转发失败: {e}"
+
+    # ==========================================
+    # LLM Tool: 转发最近的图片/表情包
+    # ==========================================
+    @llm_tool(name="crossflow_forward_images")
+    async def tool_forward_images(
+        self,
+        event: AstrMessageEvent,
+        source_group_id: str,
+        target_type: str,
+        target_id: str,
+        count: int = 5,
+        scan_count: int = 50,
+    ) -> str:
+        """从指定群的聊天记录中提取最近的图片/表情包，逐条转发到目标群或私聊。当用户要求转发图片、把表情包发给某人/某群时使用此工具。
+
+        Args:
+            source_group_id(string): 源群号（从哪个群获取图片），纯数字字符串。
+            target_type(string): 目标类型，"group"（群聊）或 "private"（私聊好友）。
+            target_id(string): 目标ID，群号或好友QQ号，纯数字字符串。
+            count(number): 要转发的图片数量，默认5张，最大20张。
+            scan_count(number): 从群历史中扫描的消息总数，默认50条。扫描越多找到的图片越多。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+
+        source_group_id = str(source_group_id).strip() if source_group_id else ""
+        target_id = str(target_id).strip() if target_id else ""
+        if not source_group_id or not source_group_id.isdigit():
+            return "错误：源群号必须是纯数字。"
+        if target_type not in ("group", "private"):
+            return "错误：target_type 必须是 'group' 或 'private'。"
+        if not target_id or not target_id.isdigit():
+            return "错误：目标ID必须是纯数字。"
+
+        count = max(1, min(20, int(count)))
+        scan_count = max(1, min(200, int(scan_count)))
+        src_gid = int(source_group_id)
+        tgt_id = int(target_id)
+
+        try:
+            ret = await bot.call_action(
+                "get_group_msg_history",
+                group_id=src_gid,
+                message_seq=0,
+                count=scan_count,
+                reverseOrder=False,
+            )
+            messages = ret.get("messages", [])
+            if not messages:
+                return f"源群 {source_group_id} 没有获取到任何消息。"
+
+            # 提取包含图片的消息 ID
+            image_msg_ids = []
+            for msg in messages:
+                msg_id = msg.get("message_id")
+                if not msg_id:
+                    continue
+                has_image = any(
+                    part.get("type") == "image"
+                    for part in msg.get("message", [])
+                )
+                if has_image:
+                    image_msg_ids.append(msg_id)
+                    if len(image_msg_ids) >= count:
+                        break
+
+            if not image_msg_ids:
+                return f"在源群 {source_group_id} 最近 {scan_count} 条消息中没有找到图片。"
+
+            # 逐条转发图片消息
+            success = 0
+            for msg_id in image_msg_ids:
+                try:
+                    if target_type == "group":
+                        await bot.call_action("forward_group_single_msg", group_id=tgt_id, message_id=msg_id)
+                    else:
+                        await bot.call_action("forward_friend_single_msg", user_id=tgt_id, message_id=msg_id)
+                    success += 1
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.debug(f"[CrossFlow] 转发图片消息失败 msg_id={msg_id}: {e}")
+
+            target_name = "群" if target_type == "group" else "用户"
+            logger.info(f"[CrossFlow] 图片转发: {source_group_id} -> {target_type}:{target_id}, 成功{success}/{len(image_msg_ids)}张")
+            return f"已从群 {source_group_id} 转发 {success} 张图片/表情包到{target_name} {target_id}。"
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 转发图片失败: {e}")
+            return f"转发图片失败: {e}"
+
+    # ==========================================
     # LLM Tool: 获取私聊聊天记录
     # ==========================================
     @llm_tool(name="crossflow_get_private_history")
