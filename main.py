@@ -926,6 +926,82 @@ class CrossFlowPlugin(Star):
         except Exception as e:
             logger.error(f"[CrossFlow] 转发消息失败: {e}")
             return f"转发失败: {e}"
+    # ==========================================
+    # LLM Tool: 转发私聊消息到其他地方
+    # ==========================================
+    @llm_tool(name="crossflow_forward_private_messages")
+    async def tool_forward_private_messages(
+        self,
+        event: AstrMessageEvent,
+        source_user_id: str,
+        target_type: str,
+        target_id: str,
+        count: int = 10,
+    ) -> str:
+        """从与指定好友的私聊记录中获取最近X条消息，逐条转发到目标群或私聊。当用户要求把和某人的私聊记录转发给别人/别的群时使用此工具。
+
+        Args:
+            source_user_id(string): 源私聊用户QQ号（从谁的私聊获取消息），纯数字字符串。
+            target_type(string): 目标类型，"group"（群聊）或 "private"（私聊好友）。
+            target_id(string): 目标ID，群号或好友QQ号，纯数字字符串。
+            count(number): 转发的消息条数，默认10条，最大100条。
+        """
+        bot = self._get_bot(event)
+        if not bot:
+            return "错误：当前平台不支持此功能，仅支持QQ（aiocqhttp）平台。"
+        has_perm, perm_reason = self._check_perm(event)
+        if not has_perm:
+            return perm_reason
+
+        source_user_id = str(source_user_id).strip() if source_user_id else ""
+        target_id = str(target_id).strip() if target_id else ""
+        if not source_user_id or not source_user_id.isdigit():
+            return "错误：源用户QQ号必须是纯数字。"
+        if target_type not in ("group", "private"):
+            return "错误：target_type 必须是 'group' 或 'private'。"
+        if not target_id or not target_id.isdigit():
+            return "错误：目标ID必须是纯数字。"
+
+        count = max(1, min(100, int(count)))
+        src_uid = int(source_user_id)
+        tgt_id = int(target_id)
+
+        try:
+            ret = await bot.call_action(
+                "get_friend_msg_history",
+                user_id=src_uid,
+                message_seq=0,
+                count=count,
+                reverseOrder=False,
+            )
+            messages = ret.get("messages", [])
+            if not messages:
+                return f"没有获取到与用户 {source_user_id} 的私聊记录。可能不是好友。"
+
+            # 逐条转发
+            success = 0
+            for msg in messages:
+                msg_id = msg.get("message_id")
+                if not msg_id:
+                    continue
+                try:
+                    if target_type == "group":
+                        await bot.call_action("forward_group_single_msg", group_id=tgt_id, message_id=msg_id)
+                    else:
+                        await bot.call_action("forward_friend_single_msg", user_id=tgt_id, message_id=msg_id)
+                    success += 1
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.debug(f"[CrossFlow] 私聊逐条转发失败 msg_id={msg_id}: {e}")
+
+            target_name = "群" if target_type == "group" else "用户"
+            logger.info(f"[CrossFlow] 私聊转发: 用户{source_user_id} -> {target_type}:{target_id}, 成功{success}/{len(messages)}条")
+            return f"已将与用户 {source_user_id} 的 {success} 条私聊消息逐条转发到{target_name} {target_id}。"
+
+        except Exception as e:
+            logger.error(f"[CrossFlow] 私聊转发失败: {e}")
+            return f"转发失败: {e}。可能不支持 get_friend_msg_history API 或该用户不是好友。"
+
 
     # ==========================================
     # LLM Tool: 转发最近的图片/表情包
