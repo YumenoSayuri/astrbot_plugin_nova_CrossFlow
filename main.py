@@ -937,14 +937,16 @@ class CrossFlowPlugin(Star):
         target_type: str,
         target_id: str,
         count: int = 10,
+        mode: str = "merge",
     ) -> str:
-        """从与指定好友的私聊记录中获取最近X条消息，逐条转发到目标群或私聊。当用户要求把和某人的私聊记录转发给别人/别的群时使用此工具。
+        """从与指定好友的私聊记录中获取最近X条消息，转发到目标群或私聊。当用户要求把和某人的私聊记录转发给别人/别的群时使用此工具。
 
         Args:
             source_user_id(string): 源私聊用户QQ号（从谁的私聊获取消息），纯数字字符串。
             target_type(string): 目标类型，"group"（群聊）或 "private"（私聊好友）。
             target_id(string): 目标ID，群号或好友QQ号，纯数字字符串。
             count(number): 转发的消息条数，默认10条，最大100条。
+            mode(string): 转发模式，"merge"（合并转发，默认）或 "single"（逐条转发）。注意：合并转发到临时会话（非好友私聊）可能不支持。
         """
         bot = self._get_bot(event)
         if not bot:
@@ -978,25 +980,58 @@ class CrossFlowPlugin(Star):
             if not messages:
                 return f"没有获取到与用户 {source_user_id} 的私聊记录。可能不是好友。"
 
-            # 逐条转发
-            success = 0
-            for msg in messages:
-                msg_id = msg.get("message_id")
-                if not msg_id:
-                    continue
-                try:
-                    if target_type == "group":
-                        await bot.call_action("forward_group_single_msg", group_id=tgt_id, message_id=msg_id)
-                    else:
-                        await bot.call_action("forward_friend_single_msg", user_id=tgt_id, message_id=msg_id)
-                    success += 1
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    logger.debug(f"[CrossFlow] 私聊逐条转发失败 msg_id={msg_id}: {e}")
-
             target_name = "群" if target_type == "group" else "用户"
-            logger.info(f"[CrossFlow] 私聊转发: 用户{source_user_id} -> {target_type}:{target_id}, 成功{success}/{len(messages)}条")
-            return f"已将与用户 {source_user_id} 的 {success} 条私聊消息逐条转发到{target_name} {target_id}。"
+
+            if mode == "single":
+                # 逐条转发
+                success = 0
+                for msg in messages:
+                    msg_id = msg.get("message_id")
+                    if not msg_id:
+                        continue
+                    try:
+                        if target_type == "group":
+                            await bot.call_action("forward_group_single_msg", group_id=tgt_id, message_id=msg_id)
+                        else:
+                            await bot.call_action("forward_friend_single_msg", user_id=tgt_id, message_id=msg_id)
+                        success += 1
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.debug(f"[CrossFlow] 私聊逐条转发失败 msg_id={msg_id}: {e}")
+
+                logger.info(f"[CrossFlow] 私聊逐条转发: 用户{source_user_id} -> {target_type}:{target_id}, 成功{success}/{len(messages)}条")
+                return f"已将与用户 {source_user_id} 的 {success} 条私聊消息逐条转发到{target_name} {target_id}。"
+
+            else:
+                # 合并转发
+                nodes = []
+                for msg in messages:
+                    sender = msg.get("sender", {})
+                    node = {
+                        "type": "node",
+                        "data": {
+                            "name": sender.get("nickname", "未知"),
+                            "uin": sender.get("user_id", 0),
+                            "content": msg.get("message", []),
+                        },
+                    }
+                    nodes.append(node)
+
+                BATCH_SIZE = 100
+                total_batches = (len(nodes) + BATCH_SIZE - 1) // BATCH_SIZE
+
+                for batch_idx in range(total_batches):
+                    batch = nodes[batch_idx * BATCH_SIZE : (batch_idx + 1) * BATCH_SIZE]
+                    if target_type == "group":
+                        await bot.call_action("send_group_forward_msg", group_id=tgt_id, messages=batch)
+                    else:
+                        await bot.call_action("send_private_forward_msg", user_id=tgt_id, messages=batch)
+                    if batch_idx < total_batches - 1:
+                        await asyncio.sleep(1.0)
+
+                batch_text = f"，分{total_batches}批" if total_batches > 1 else ""
+                logger.info(f"[CrossFlow] 私聊合并转发: 用户{source_user_id} -> {target_type}:{target_id}, {len(nodes)}条{batch_text}")
+                return f"已将与用户 {source_user_id} 的 {len(nodes)} 条私聊消息合并转发到{target_name} {target_id}{batch_text}。"
 
         except Exception as e:
             logger.error(f"[CrossFlow] 私聊转发失败: {e}")
